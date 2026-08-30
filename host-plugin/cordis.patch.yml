@@ -1,0 +1,8 @@
+# dsh bundle patch: inserts the mcp-manager plugin into a profile's layer stack.
+# Applied automatically after `dsh plugin --profile <name> add <this package>`;
+# no manual cordis.patch.yml editing is required.
+- insert:
+    - id: mcp-manager
+      name: 'mcp-manager'
+      config:
+        autoConnect: true

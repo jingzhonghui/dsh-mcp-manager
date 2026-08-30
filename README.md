@@ -7,7 +7,7 @@
 - 一键 连接 / 断开 / 删除 服务器
 - 把服务器暴露的工具注册为 `mcp__<serverName>__<toolName>`，可直接供 Agent 调用
 - **配置持久化**：服务器配置写入 `$DSH_HOME/mcp-manager.json`，重启 DSH 不丢失、自动重连
-- **宿主机级**：挂载在 profile 的 `cordis.patch.yml`，进程级存活，卸载 = 删除挂载行
+- **宿主机级**：以 `dsh.bundle` 形式经 `dsh plugin` 安装进 profile 的 `dsh.profile.bundles` 层（其 `cordis.patch.yml` 自动 insert 插件行），进程级存活，卸载 = `dsh plugin --profile web remove mcp-manager`
 
 ## 界面
 
@@ -20,20 +20,39 @@
 
 ## 安装（宿主机插件版，推荐）
 
-`host-plugin/` 是一个完整的 npm 包（`mcp-manager`），host 半在 `lib/index.js`、client 半在 `lib/client.js`（手写 `__ModuleLoader__` bundle，无构建步骤）。
+`host-plugin/` 是一个完整的 npm 包（`mcp-manager`），host 半在 `lib/index.js`、client 半在 `lib/client.js`（手写 `__ModuleLoader__` bundle，无构建步骤）。包声明了 `dsh.bundle`，可直接用 **`dsh plugin`** 安装（pnpm 转发 + 自动挂载到 `dsh.profile.bundles` 层）——无需复制目录、无需手改 `cordis.patch.yml`。
 
-1. 把 `host-plugin/` 整个目录放到 **profile 的 `node_modules/`** 下（如 `~/.dsh/profiles/web/node_modules/mcp-manager/`）。
-2. 在 profile 的 `cordis.patch.yml` 追加（**必须用 `insert` 包裹**——patch 层顶层数组里裸行会被当作"修补不存在的条目"而跳过）：
+### 本地克隆安装（推荐）
 
-```yaml
-- insert:
-    - id: mcp-manager
-      name: 'mcp-manager'
-      config:
-        autoConnect: true
+```bash
+git clone <仓库地址> dsh-mcp-manager
+cd dsh-mcp-manager
+dsh plugin --profile web add file:./host-plugin
 ```
 
-3. 重启 DSH，打开 **设置页 → MCP 服务器**。
+- `file:./host-plugin` 的相对路径以**当前目录**为锚点解析（`dsh plugin` 会做 cwd 锚定）；绝对路径亦可，如 `dsh plugin --profile web add C:\path\to\host-plugin`。
+- 安装后 `dsh plugin` 自动把 `mcp-manager` 加入 profile 的 `dsh.profile.bundles` 层，**重启 DSH** 即自动挂载，打开 **设置页 → MCP 服务器**。
+- 本地路径安装是符号链接：改 `host-plugin/` 代码后重启 DSH 即生效，适合开发迭代。
+
+### 发布 npm 后安装（可选，面向分发）
+
+```bash
+cd host-plugin
+npm publish
+dsh plugin --profile web add mcp-manager
+```
+
+### 升级 / 卸载
+
+- 升级：`dsh plugin --profile web update mcp-manager`（或重新 `add` 新路径/新版本）
+- 卸载：`dsh plugin --profile web remove mcp-manager`（同时移出 bundles 层）
+
+### 从旧版（手动复制 + 手动 insert）迁移
+
+1. `dsh plugin --profile web add file:./host-plugin`（或绝对路径），重启 DSH 确认面板正常
+2. 删除 `~/.dsh/profiles/web/cordis.patch.yml` 里手动追加的 `mcp-manager` insert 块（否则与 bundle patch 重复挂载）
+3. 删除 `~/.dsh/profiles/web/node_modules/mcp-manager/` 旧副本（若存在）
+4. 再次重启 DSH
 
 首次启动会读取 `$DSH_HOME/mcp-manager.json`（不存在则视为空配置），自动连接全部已配置服务器。
 
