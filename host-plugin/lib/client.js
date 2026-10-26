@@ -5,9 +5,8 @@
 // tsdown emits for every DSH client plugin. Dependencies arrive via require()
 // from the module table (react is a seed word), so no build step is needed.
 // This half registers the "MCP 服务器" section in the settings sidebar and
-// talks to the host half over the /mcp-manager RPC channel via
-// ctx.connection.rpc.call (the connection service provided by
-// @deepseek-ai/dsh-client-connection).
+// talks to the host half's exact Fetch route at /api/mcp-manager with a plain
+// same-origin POST (authenticated by the existing browser session).
 // ============================================================================
 
 window.__ModuleLoader__.load({
@@ -47,6 +46,8 @@ window.__ModuleLoader__.load({
             ".mcp-btn{padding:4px 10px;border-radius:6px;border:1px solid var(--dsw-alias-divider,#e5e7eb);background:var(--dsw-alias-surface-primary,#fff);color:var(--dsw-alias-label-primary,#111827);font-size:12px;cursor:pointer}",
             ".mcp-btn:disabled{opacity:.5;cursor:not-allowed}",
             ".mcp-btn-primary{background:var(--dsw-alias-accent-primary,#4f46e5);border-color:var(--dsw-alias-accent-primary,#4f46e5);color:#fff}",
+            ".mcp-section-title{font-size:12px;font-weight:600;color:var(--dsw-alias-label-secondary,#9ca3af);margin-top:4px}",
+            ".mcp-row-profile{background:var(--dsw-alias-surface-primary,#fff)}",
             ".mcp-form{display:flex;flex-direction:column;gap:8px;padding:12px;border:1px dashed var(--dsw-alias-divider,#e5e7eb);border-radius:8px}",
             ".mcp-field{display:flex;flex-direction:column;gap:4px}",
             ".mcp-field label{font-size:12px;color:var(--dsw-alias-label-secondary,#9ca3af)}",
@@ -62,8 +63,6 @@ window.__ModuleLoader__.load({
     injectStyles();
 
     var STATUS_TEXT = { connected: "已连接", connecting: "连接中", disconnected: "未连接", error: "错误" };
-    // Module-level ctx captured at apply time; components cannot see apply's parameter.
-    var rootCtx = null;
     var STATUS_COLOR = {
       connected: "var(--dsw-alias-state-success-primary, #22c55e)",
       connecting: "var(--dsw-alias-state-warn-primary, #f59e0b)",
@@ -71,9 +70,10 @@ window.__ModuleLoader__.load({
       error: "var(--dsw-alias-state-error-primary, #ef4444)",
     };
     var EMPTY_FORM = { name: "", command: "", args: "", env: "", cwd: "", timeout: "60000" };
+    var NATIVE_STATUS = { true: "已连接", false: "未连接" };
 
     function McpManagerPanel(props) {
-      var state = react.useState({ servers: [], loading: true, error: null });
+      var state = react.useState({ servers: [], native: [], loading: true, error: null });
       var view = state[0];
       var setView = state[1];
       var state2 = react.useState(false);
@@ -86,20 +86,35 @@ window.__ModuleLoader__.load({
       var form = state4[0];
       var setForm = state4[1];
 
-      // Call host RPC and unwrap the RpcResult envelope {ok:true,value} | {ok:false,error}.
+      // Post to the host half's exact Fetch route and unwrap its {ok:true,value}
+      // | {ok:false,error} envelope. Same-origin cookies authenticate the call;
+      // the Connection carrier answers 401/403 before the handler runs.
       function call(endpoint, payload) {
-        var conn = rootCtx && rootCtx.get("connection");
-        if (!conn || !conn.rpc || !conn.rpc.call) return Promise.reject(new Error("connection rpc unavailable"));
-        return conn.rpc.call("/mcp-manager", endpoint, payload).then(function (res) {
-          if (res && res.ok === true) return res.value;
-          var msg = (res && res.error && res.error.message) || "RPC failed";
+        return fetch("api/mcp-manager", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          credentials: "same-origin",
+          body: JSON.stringify({ endpoint: endpoint, payload: payload || {} }),
+        }).then(function (res) {
+          if (!res.ok) throw new Error("HTTP " + res.status);
+          return res.json();
+        }).then(function (body) {
+          if (body && body.ok === true) return body.value;
+          var msg = (body && body.error && body.error.message) || "request failed";
           throw new Error(msg);
         });
       }
 
       var refresh = react.useCallback(function () {
         call("list", {}).then(function (value) {
-          setView(function (v) { return { ...v, loading: false, servers: (value && value.servers) || [] }; });
+          setView(function (v) {
+            return {
+              ...v,
+              loading: false,
+              servers: (value && value.servers) || [],
+              native: (value && value.nativeServers) || [],
+            };
+          });
         }).catch(function (err) {
           setView(function (v) { return { ...v, loading: false, error: String((err && err.message) || err) }; });
         });
@@ -142,12 +157,43 @@ window.__ModuleLoader__.load({
         }).then(function (value) {
           setFormOpen(false);
           setForm(EMPTY_FORM);
-          setView({ servers: (value && value.servers) || [], loading: false, error: null });
+          setView(function (v) {
+            return {
+              ...v,
+              servers: (value && value.servers) || [],
+              native: (value && value.nativeServers) || v.native || [],
+              loading: false,
+              error: null,
+            };
+          });
         }).catch(setError);
       };
 
       var connected = 0;
       for (var i = 0; i < view.servers.length; i++) if (view.servers[i].status === "connected") connected += 1;
+
+      var nativeActive = 0;
+      for (var n = 0; n < view.native.length; n++) if (view.native[n].active) nativeActive += 1;
+
+      // Servers the profile itself mounts (`@deepseek-ai/dsh-mcp-client` rows in
+      // cordis.patch.yml). Their tools already exist as mcp__<name>__*, so they
+      // are listed read-only instead of being duplicated by this manager.
+      var nativeRows = view.native.map(function (s) {
+        return react.createElement("div", { className: "mcp-row mcp-row-profile", key: "profile-" + s.id },
+          react.createElement("span", { className: "mcp-dot", style: { background: s.active ? STATUS_COLOR.connected : STATUS_COLOR.disconnected } }),
+          react.createElement("div", { className: "mcp-main" },
+            react.createElement("div", { className: "mcp-name" },
+              react.createElement("span", null, s.name || s.id || "(unnamed)"),
+              react.createElement("span", { className: "mcp-badge" }, s.transport),
+              react.createElement("span", { className: "mcp-badge" }, "profile"),
+              react.createElement("span", { className: "mcp-status" },
+                (s.active ? "已连接" : "未连接") + (s.toolCount ? " · " + s.toolCount + " 个工具" : " · 0 个工具"))
+            ),
+            react.createElement("div", { className: "mcp-meta" }, s.commandLine || "(no command)"),
+            react.createElement("div", { className: "mcp-meta" }, "由 profile 的 cordis.patch.yml 配置，此处只读")
+          )
+        );
+      });
 
       var rows = view.servers.map(function (s) {
         return react.createElement("div", { className: "mcp-row", key: s.id },
@@ -174,15 +220,22 @@ window.__ModuleLoader__.load({
       return react.createElement("div", { className: "mcp-manager" },
         react.createElement("div", { className: "mcp-header" },
           react.createElement("div", { className: "mcp-title" }, "MCP 服务器管理"),
-          react.createElement("div", { className: "mcp-sub" }, connected + "/" + view.servers.length + " 已连接"),
+          react.createElement("div", { className: "mcp-sub" },
+            connected + "/" + view.servers.length + " 已连接" +
+            (view.native.length > 0 ? " · profile " + nativeActive + "/" + view.native.length + " 已连接" : "")),
           react.createElement("div", { className: "mcp-header-actions" },
             react.createElement("button", { className: "mcp-btn mcp-btn-primary", onClick: function () { setFormOpen(function (v) { return !v; }); } }, formOpen ? "收起表单" : "添加服务器"),
             react.createElement("button", { className: "mcp-btn", disabled: view.servers.length === 0, onClick: function () { act("removeAll", {}, "all"); } }, "清空")
           )
         ),
         view.error ? react.createElement("div", { className: "mcp-banner" }, String(view.error)) : null,
-        view.loading ? react.createElement("div", { className: "mcp-empty" }, "加载中…") : rows,
-        !formOpen && !view.loading && view.servers.length === 0 ? react.createElement("div", { className: "mcp-empty" }, "尚未配置 MCP 服务器，点击“添加服务器”开始") : null,
+        view.loading ? react.createElement("div", { className: "mcp-empty" }, "加载中…") : null,
+        !view.loading && view.native.length > 0 ? react.createElement("div", null,
+          react.createElement("div", { className: "mcp-section-title" }, "已由 DSH profile 连接的 MCP 服务器（" + view.native.length + "）"),
+          nativeRows
+        ) : null,
+        !view.loading ? rows : null,
+        !formOpen && !view.loading && view.servers.length === 0 && view.native.length === 0 ? react.createElement("div", { className: "mcp-empty" }, "尚未配置 MCP 服务器，点击“添加服务器”开始") : null,
         formOpen ? react.createElement("div", { className: "mcp-form" },
           react.createElement("div", { className: "mcp-field" }, react.createElement("label", null, "名称 *"), react.createElement("input", { value: form.name, onChange: setField("name"), placeholder: "serverName（字母/数字/-/_，≤32）" })),
           react.createElement("div", { className: "mcp-field" }, react.createElement("label", null, "命令 *"), react.createElement("input", { value: form.command, onChange: setField("command"), placeholder: "绝对路径或 PATH 命令，如 npx / uvx / node / python" })),
@@ -198,11 +251,11 @@ window.__ModuleLoader__.load({
       );
     }
 
-    // Cordis service injection (client side): slots = settings sections,
-    // connection = RPC transport to the host half.
-    var inject = ["slots", "connection"];
+    // Cordis service injection (client side): slots = settings sections. The
+    // host half's Fetch route needs no client service: same-origin fetch rides
+    // the existing browser session.
+    var inject = ["slots"];
     function apply(ctx) {
-      rootCtx = ctx;
       var slots = ctx.get("slots");
       if (slots === undefined) return;
       slots.inject("settings.section", function () {

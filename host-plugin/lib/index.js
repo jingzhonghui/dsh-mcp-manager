@@ -5,8 +5,8 @@
 //   - server configs persist to a JSON file (survive restarts)
 //   - auto-connects every configured server on plugin activation
 //   - registers each server's tools on ctx.tools as mcp__<server>__<tool>
-//   - exposes a unary RPC channel (/mcp-manager) consumed by the settings
-//     page client half: list/add/remove/connect/disconnect/removeAll
+//   - serves the settings page client half through one exact Fetch route on
+//     /api/mcp-manager: list/add/remove/connect/disconnect/removeAll
 //
 // This is a REAL Cordis plugin (no sandbox): node:fs, process, etc. are
 // available. It is mounted from cordis.yml like any host plugin.
@@ -17,12 +17,20 @@ import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 export const name = 'mcp-manager'
-export const inject = ['subprocess', 'tools', 'timer', 'connection']
+export const inject = ['subprocess', 'tools', 'timer']
 
 const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v)
 const MAX_PUBLIC_NAME = 64
 const HASH_LENGTH = 12
 const SCALARS = { string: 1, number: 1, integer: 1, boolean: 1, null: 1 }
+/** Exact Fetch route the settings page posts to; below the Connection-owned `/api` channel. */
+const MCP_MANAGER_ROUTE = '/api/mcp-manager'
+/** DSH-native MCP bridge: one Loader entry per server, configured by the profile patch. */
+const NATIVE_MCP_CLIENT = '@deepseek-ai/dsh-mcp-client'
+const jsonResponse = (body) => new Response(JSON.stringify(body), {
+  status: 200,
+  headers: { 'content-type': 'application/json' }
+})
 
 function fnv1a(str, seed) {
   let h = seed >>> 0
@@ -429,11 +437,17 @@ export function apply(ctx, config = {}) {
     s.error = undefined
     s.closing = false
   }
-  function buildServer(a) {
-    const rawName = String(a.name || '').trim()
+  /** Public server name as this manager would register it; throws when unusable. */
+  function normalizeServerName(raw) {
+    const rawName = String(raw || '').trim()
     let name = rawName.replace(/[^A-Za-z0-9_-]/g, '_').replace(/_+/g, '_').replace(/^_+|_+$/g, '')
     if (!name) throw new Error('name 必填（字母/数字/-/_）')
     if (name.length > 32) name = name.slice(0, 32)
+    return name
+  }
+
+  function buildServer(a) {
+    const name = normalizeServerName(a.name)
     if (Array.from(servers.values()).some((s) => s.name === name)) throw new Error('服务器名已存在: ' + name)
     const command = String(a.command || '').trim()
     if (!command) throw new Error('command 必填')
@@ -475,54 +489,137 @@ export function apply(ctx, config = {}) {
     for (const s of Array.from(servers.values())) enqueue(s, () => connectServer(s))
   }
 
-  // --- RPC channel (consumed by the client half via ctx.connection.rpc.call) ---
-  ctx.effect(() => {
-    const disposer = ctx.connection.rpc.handle('/mcp-manager', async (endpoint, args) => {
-      try {
-        let servers
-        if (endpoint === 'list') {
-          servers = listViews()
-        } else if (endpoint === 'add') {
-          const s = buildServer(isObj(args) ? args : {})
-          persist()
-          if (isObj(args) && args.connect === true) enqueue(s, () => connectServer(s))
-          servers = listViews()
-        } else if (endpoint === 'remove') {
-          const s = findServer(args && args.id)
-          s.closing = true
-          await teardownProcess(s)
-          servers.delete(s.id)
-          persist()
-          servers = listViews()
-        } else if (endpoint === 'connect') {
-          const s = findServer(args && args.id)
-          enqueue(s, () => connectServer(s))
-          servers = listViews()
-        } else if (endpoint === 'disconnect') {
-          const s = findServer(args && args.id)
-          await disconnectServer(s)
-          servers = listViews()
-        } else if (endpoint === 'removeAll') {
-          for (const s of Array.from(servers.values())) { s.closing = true; await teardownProcess(s) }
-          servers.clear()
-          persist()
-          servers = []
-        } else {
+  // --- Settings-page transport ---
+  // One exact Fetch route on the shared API channel. This is the documented
+  // extension point for feature endpoints: Connection owns the physical /api
+  // route, authenticates the browser peer, and parses the buffered body, so the
+  // registration itself must not touch the Web server.
+  // The envelope stays {ok:true,value} | {ok:false,error} for the client half.
+  /**
+   * Live DSH-native MCP servers. Each `@deepseek-ai/dsh-mcp-client` Loader row
+   * connects one server and registers `mcp__<serverName>__*` tools, so the
+   * profile's own servers must stay visible here even though this manager does
+   * not own their configuration (they live in the profile's cordis.patch.yml).
+   */
+  const nativeServers = () => {
+    const loader = ctx.get('loader')
+    const tools = ctx.get('tools')
+    let schemas = []
+    try {
+      schemas = tools && typeof tools.schemas === 'function' ? tools.schemas() : []
+    } catch (err) {
+      schemas = []
+    }
+    const rows = []
+    let entries = []
+    try {
+      entries = loader && typeof loader.entries === 'function' ? Array.from(loader.entries()) : []
+    } catch (err) {
+      entries = []
+    }
+    for (const entry of entries) {
+      const options = entry && entry.options
+      if (!isObj(options)) continue
+      const pluginName = String(options.name === undefined ? '' : options.name)
+      if (pluginName !== NATIVE_MCP_CLIENT && !pluginName.endsWith('/dsh-mcp-client')) continue
+      const cfg = isObj(options.config) ? options.config : {}
+      const serverName = typeof cfg.serverName === 'string' ? cfg.serverName : ''
+      const prefix = serverName === '' ? '' : 'mcp__' + serverName + '__'
+      const http = cfg.transport === 'streamable-http'
+      rows.push({
+        source: 'profile',
+        id: String(options.id === undefined ? (entry.id === undefined ? '' : entry.id) : options.id),
+        name: serverName,
+        transport: http ? 'streamable-http' : 'stdio',
+        commandLine: http
+          ? String(cfg.url === undefined ? '' : cfg.url)
+          : [cfg.command].concat(Array.isArray(cfg.args) ? cfg.args : [])
+            .filter((part) => typeof part === 'string' && part !== '').join(' '),
+        active: entry.fiber !== undefined && entry.fiber !== null && entry.fiber.state === 2,
+        toolCount: prefix === '' ? 0
+          : schemas.filter((t) => isObj(t) && typeof t.name === 'string' && t.name.startsWith(prefix)).length
+      })
+    }
+    return rows
+  }
+
+  const handleManagerRequest = async (endpoint, payload) => {
+    try {
+      let views
+      if (endpoint === 'list') {
+        views = listViews()
+      } else if (endpoint === 'add') {
+        const candidate = normalizeServerName(isObj(payload) ? payload.name : '')
+        const clash = nativeServers().find((row) => row.name !== '' && row.name === candidate)
+        if (clash) {
           return {
             ok: false,
-            error: { code: 'bad-request', message: 'unknown endpoint: ' + String(endpoint), details: { issues: [] } }
+            error: {
+              code: 'conflict',
+              message: '服务器名「' + candidate + '」已被 profile 配置的 MCP 服务器占用（cordis.patch.yml 中的 @deepseek-ai/dsh-mcp-client 行），其工具名 mcp__' + candidate + '__* 会冲突；请换一个名称，或直接使用上面列出的现有 MCP。',
+              details: { issues: [] }
+            }
           }
         }
-        return { ok: true, value: { servers } }
-      } catch (err) {
+        const s = buildServer(isObj(payload) ? payload : {})
+        persist()
+        if (isObj(payload) && payload.connect === true) enqueue(s, () => connectServer(s))
+        views = listViews()
+      } else if (endpoint === 'remove') {
+        const s = findServer(payload && payload.id)
+        s.closing = true
+        await teardownProcess(s)
+        servers.delete(s.id)
+        persist()
+        views = listViews()
+      } else if (endpoint === 'connect') {
+        const s = findServer(payload && payload.id)
+        enqueue(s, () => connectServer(s))
+        views = listViews()
+      } else if (endpoint === 'disconnect') {
+        const s = findServer(payload && payload.id)
+        await disconnectServer(s)
+        views = listViews()
+      } else if (endpoint === 'removeAll') {
+        for (const s of Array.from(servers.values())) { s.closing = true; await teardownProcess(s) }
+        servers.clear()
+        persist()
+        views = []
+      } else {
         return {
           ok: false,
-          error: { code: 'bad-request', message: String((err && err.message) || err), details: { issues: [] } }
+          error: { code: 'bad-request', message: 'unknown endpoint: ' + String(endpoint), details: { issues: [] } }
         }
       }
-    }, { authority: 'loopback' })
-    return disposer
-  }, 'mcp-manager.rpc')
+      return { ok: true, value: { servers: views, nativeServers: nativeServers() } }
+    } catch (err) {
+      return {
+        ok: false,
+        error: { code: 'bad-request', message: String((err && err.message) || err), details: { issues: [] } }
+      }
+    }
+  }
+
+  // Mount the route only where Connection is present; the manager itself keeps
+  // working (persisted config + MCP tools) on carriers without a Web UI.
+  ctx.inject(['connection'], (routeCtx) => {
+    routeCtx.effect(() => routeCtx.connection.fetch.register({
+      path: MCP_MANAGER_ROUTE,
+      methods: ['POST'],
+      requestBody: 'buffered',
+      fetch: async (request) => {
+        let body
+        try {
+          body = await request.json()
+        } catch (err) {
+          return jsonResponse({ ok: false, error: { code: 'bad-request', message: 'body is not JSON', details: { issues: [] } } })
+        }
+        const endpoint = isObj(body) ? body.endpoint : undefined
+        const payload = isObj(body) ? body.payload : undefined
+        return jsonResponse(await handleManagerRequest(endpoint, payload))
+      }
+    }), 'mcp-manager.fetch')
+  })
 
   // --- Cleanup on plugin stop ---
   ctx.effect(() => {
